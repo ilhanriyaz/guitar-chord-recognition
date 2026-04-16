@@ -6,7 +6,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "huggingface-hub>=1.10.2",
+    "jupyter>=1.1.1",
     "librosa>=0.11.0",
+    "matplotlib>=3.10.8",
+    "matplotlib-inline>=0.2.1",
     "numpy>=2.4.4",
     "pandas>=3.0.2",
 ]
