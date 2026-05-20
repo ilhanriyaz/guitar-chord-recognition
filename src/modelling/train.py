@@ -1,4 +1,5 @@
 import pandas as pd
+import xgboost as xgb
 from xgboost import XGBClassifier
 
 train_df = pd.read_csv("data/processed/train.csv")
@@ -10,4 +11,3 @@ y_train = train_df["label"].values
 X_test = test_df[chroma_cols].values
 y_test = test_df["label"].values
 
-xg_model = XGBClassifier()
