@@ -13,5 +13,8 @@ dependencies = [
     "numpy>=2.4.4",
     "optuna>=4.9.0",
     "pandas>=3.0.2",
+    "scikit-learn>=1.6.1",
+    "torch>=2.6.0",
+    "torchvision>=0.21.0",
     "xgboost>=3.2.0",
 ]
