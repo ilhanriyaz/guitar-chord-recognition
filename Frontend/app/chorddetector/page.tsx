@@ -6,7 +6,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'] as const;
 
-type ChordTemplate = { name: string; vec: number[] };
+type ChordTemplate = { name: string; vec: number[]; tones: number[] };
 
 function buildTemplates(): ChordTemplate[] {
   const majorIntervals = [0, 4, 7];
@@ -16,11 +16,11 @@ function buildTemplates(): ChordTemplate[] {
   for (let root = 0; root < 12; root++) {
     const maj = new Array(12).fill(0);
     majorIntervals.forEach((iv) => (maj[(root + iv) % 12] = 1));
-    templates.push({ name: NOTE_NAMES[root], vec: maj });
+    templates.push({ name: NOTE_NAMES[root], vec: maj, tones: majorIntervals.map((iv) => (root + iv) % 12) });
 
     const min = new Array(12).fill(0);
     minorIntervals.forEach((iv) => (min[(root + iv) % 12] = 1));
-    templates.push({ name: `${NOTE_NAMES[root]}m`, vec: min });
+    templates.push({ name: `${NOTE_NAMES[root]}m`, vec: min, tones: minorIntervals.map((iv) => (root + iv) % 12) });
   }
   return templates;
 }
@@ -42,38 +42,117 @@ function cosineSim(a: number[], b: number[]): number {
 
 // Given a 12-bin pitch-class energy vector, find the closest matching chord template.
 function classifyChroma(chroma: number[]): { name: string; score: number } {
-  const maxC = Math.max(...chroma);
-  if (maxC < 1e-6) return { name: '—', score: 0 };
-  const norm = chroma.map((v) => v / maxC);
+  const total = chroma.reduce((sum, value) => sum + value, 0);
+  if (total < 1e-6) return { name: '—', score: 0 };
+  const norm = chroma.map((v) => v / total);
 
   let best: ChordTemplate | null = null;
   let bestScore = -1;
+  let secondScore = -1;
   for (const t of TEMPLATES) {
-    const score = cosineSim(norm, t.vec);
+    const toneEnergy = t.tones.reduce((sum, pc) => sum + norm[pc], 0);
+    const weakestTone = Math.min(...t.tones.map((pc) => norm[pc]));
+    const strongestTone = Math.max(...t.tones.map((pc) => norm[pc]));
+    const balance = strongestTone > 0 ? weakestTone / strongestTone : 0;
+    const score = 0.55 * cosineSim(norm, t.vec) + 0.3 * toneEnergy + 0.15 * balance;
     if (score > bestScore) {
+      secondScore = bestScore;
       bestScore = score;
       best = t;
+    } else if (score > secondScore) {
+      secondScore = score;
     }
   }
-  return { name: best ? best.name : '—', score: Math.min(1, Math.max(0, bestScore)) };
+  const margin = Math.max(0, bestScore - secondScore);
+  const confidence = Math.min(1, Math.max(0, bestScore * 0.82 + margin * 2.5));
+  return { name: best ? best.name : '—', score: confidence };
 }
 
 // Accumulate FFT bin magnitudes into a 12-bin pitch-class (chroma) vector.
+//
+// Only a small fraction of the spectrum carries chord information: the note
+// fundamentals and their lowest harmonics. Everything else — the noise floor
+// and the dense clutter of upper harmonics between notes — just smears energy
+// across all 12 pitch classes and pulls the template match off the true chord.
+// So we (1) cap the analysis band at CHROMA_MAX_FREQ, (2) gate out any bin that
+// isn't loud relative to this frame's peak, and (3) weight by power (magnitude
+// squared) so genuine peaks dominate the diffuse background.
+function percentile(values: number[], fraction: number): number {
+  if (values.length === 0) return -Infinity;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.floor(fraction * sorted.length))];
+}
+
 function chromaFromFreqData(freqData: Float32Array, binHz: number): number[] {
   const chroma = new Array(12).fill(0);
-  for (let i = 1; i < freqData.length; i++) {
-    const freq = i * binHz;
-    if (freq < MIN_FREQ || freq > 5000) continue;
+  const startBin = Math.max(1, Math.floor(MIN_FREQ / binHz));
+  const endBin = Math.min(freqData.length - 2, Math.ceil(CHROMA_MAX_FREQ / binHz));
+  const band = Array.from(freqData.slice(startBin, endBin + 1)).filter(Number.isFinite);
+  const peakDb = Math.max(...band);
+  if (peakDb < CHROMA_SILENCE_DB) return chroma;
+
+  // Use the lower part of this frame's spectrum as its noise estimate. A local
+  // peak must clear both this adaptive floor and the frame-relative gate.
+  const noiseFloorDb = percentile(band, 0.35);
+  const gateDb = Math.max(CHROMA_FLOOR_DB, noiseFloorDb + NOISE_MARGIN_DB, peakDb - CHROMA_GATE_DB);
+  const peaks: { midi: number; weight: number }[] = [];
+
+  for (let i = startBin + 1; i < endBin; i++) {
     const db = freqData[i];
-    const magnitude = Math.pow(10, db / 20);
+    if (db < gateDb || db <= freqData[i - 1] || db < freqData[i + 1]) continue;
+
+    // Parabolic interpolation improves the frequency estimate between FFT bins,
+    // especially for the low E/A strings where bins are several cents wide.
+    const left = freqData[i - 1];
+    const right = freqData[i + 1];
+    const denominator = left - 2 * db + right;
+    const offset =
+      denominator === 0 ? 0 : Math.max(-0.5, Math.min(0.5, (0.5 * (left - right)) / denominator));
+    const freq = (i + offset) * binHz;
     const midi = 69 + 12 * Math.log2(freq / 440);
-    const pc = ((Math.round(midi) % 12) + 12) % 12;
-    chroma[pc] += magnitude;
+    const lowFrequencyWeight = 1 / Math.sqrt(Math.max(1, freq / 220));
+    peaks.push({ midi, weight: Math.sqrt(db - gateDb) * lowFrequencyWeight });
   }
+
+  // Estimate a per-frame tuning offset. Harmonics share their fundamental's
+  // cents offset, so a slightly flat or sharp guitar still lands on note centres.
+  let sin = 0;
+  let cos = 0;
+  for (const peak of peaks) {
+    const phase = (peak.midi - Math.round(peak.midi)) * Math.PI * 2;
+    sin += Math.sin(phase) * peak.weight;
+    cos += Math.cos(phase) * peak.weight;
+  }
+  const tuningOffset = peaks.length >= 3 ? Math.atan2(sin, cos) / (Math.PI * 2) : 0;
+
+  for (const peak of peaks) {
+    const tunedMidi = peak.midi - tuningOffset;
+    const nearest = Math.round(tunedMidi);
+    const distance = Math.abs(tunedMidi - nearest);
+    if (distance > PEAK_NOTE_WIDTH) continue;
+    const pc = ((nearest % 12) + 12) % 12;
+    const pitchWeight = 0.5 + 0.5 * Math.cos((Math.PI * distance) / PEAK_NOTE_WIDTH);
+    chroma[pc] += peak.weight * pitchWeight;
+  }
+
+  // Compression prevents one ringing string from drowning out the other tones.
+  for (let pc = 0; pc < 12; pc++) chroma[pc] = Math.sqrt(chroma[pc]);
   return chroma;
 }
 
 const MIN_FREQ = 55; // ~A1, chroma detection floor
+const CHROMA_MAX_FREQ = 1600; // fundamentals + low harmonics; above this is mostly clutter
+const CHROMA_GATE_DB = 30; // keep bins within this many dB of the frame peak
+const CHROMA_FLOOR_DB = -78; // absolute noise floor; bins quieter than this never count
+const CHROMA_SILENCE_DB = -70; // if the peak is below this, the frame is silence
+const NOISE_MARGIN_DB = 9;
+const PEAK_NOTE_WIDTH = 0.45; // semitones either side of the tuned note centre
+
+// Chord display latch: once a chord is detected confidently, keep showing it until a
+// different chord clears the threshold. This stops the readout from flickering away on
+// brief quiet spots or strum transitions.
+const CHORD_HOLD_THRESHOLD = 0.48; // confidence (including runner-up margin) needed to replace display
+const CHORD_CLEAR_MS = 2000; // after this long with no confident chord, clear to —
 
 // Spectrum display range, aligned to octave boundaries (C2 .. C7) so the
 // log-frequency axis lands cleanly on note gridlines.
@@ -82,6 +161,8 @@ const SPEC_MAX_FREQ = 2093.0; // C7
 const SPEC_MIN_MIDI = 36; // C2
 const SPEC_MAX_MIDI = 96; // C7
 const HISTORY_LEN = 8;
+const DETECTION_INTERVAL_MS = 80;
+const CHROMA_EMA_ALPHA = 0.35;
 
 const AXIS_H = 20; // reserved height at bottom of spectrum for the note axis
 
@@ -109,6 +190,9 @@ export default function ChordDetectorPage() {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const rafRef = useRef<number | null>(null);
   const historyRef = useRef<{ name: string; score: number }[]>([]);
+  const smoothedChromaRef = useRef<number[]>(new Array(12).fill(0));
+  const lastDetectionAtRef = useRef(0);
+  const lastConfidentAtRef = useRef(0); // timestamp of the last chord that cleared the hold threshold
   const streamRef = useRef<MediaStream | null>(null);
 
   const [listening, setListening] = useState(false);
@@ -157,10 +241,17 @@ export default function ChordDetectorPage() {
   }, []);
 
   const detectChord = useCallback((chroma: number[]) => {
+    const now = performance.now();
     const { name, score } = classifyChroma(chroma);
+
+    // Silent frame: don't overwrite the display. Hold the last chord through brief gaps,
+    // and only clear back to — after a sustained silence.
     if (name === '—') {
-      setChordName('—');
-      setConfidence(0);
+      if (now - lastConfidentAtRef.current > CHORD_CLEAR_MS) {
+        setChordName('—');
+        setConfidence(0);
+        historyRef.current = [];
+      }
       return;
     }
 
@@ -181,8 +272,16 @@ export default function ChordDetectorPage() {
     const avgScore =
       history.filter((h) => h.name === winner).reduce((a, b) => a + b.score, 0) / winnerCount;
 
-    setChordName(winner);
-    setConfidence(Math.round(Math.min(1, Math.max(0, avgScore)) * 100));
+    // Latch: only swap the displayed chord once a candidate clears the threshold. Below it,
+    // keep showing the last confident chord until the silence timeout elapses.
+    if (avgScore >= CHORD_HOLD_THRESHOLD) {
+      lastConfidentAtRef.current = now;
+      setChordName(winner);
+      setConfidence(Math.round(Math.min(1, Math.max(0, avgScore)) * 100));
+    } else if (now - lastConfidentAtRef.current > CHORD_CLEAR_MS) {
+      setChordName('—');
+      setConfidence(0);
+    }
   }, []);
 
   const drawSpectrumAndDetect = useCallback(
@@ -287,8 +386,19 @@ export default function ChordDetectorPage() {
         ctx.stroke();
       }
 
-      const chroma = chromaFromFreqData(freqData, binHz);
-      detectChord(chroma);
+      const now = performance.now();
+      if (now - lastDetectionAtRef.current >= DETECTION_INTERVAL_MS) {
+        const chroma = chromaFromFreqData(freqData, binHz);
+        const smoothed = smoothedChromaRef.current;
+        const hasSignal = chroma.some((value) => value > 0);
+        for (let pc = 0; pc < 12; pc++) {
+          smoothed[pc] = hasSignal
+            ? CHROMA_EMA_ALPHA * chroma[pc] + (1 - CHROMA_EMA_ALPHA) * smoothed[pc]
+            : 0;
+        }
+        lastDetectionAtRef.current = now;
+        detectChord(smoothed);
+      }
     },
     [detectChord],
   );
@@ -321,8 +431,8 @@ export default function ChordDetectorPage() {
       const audioCtx = new AudioContextCtor();
       const source = audioCtx.createMediaStreamSource(stream);
       const analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 8192;
-      analyser.smoothingTimeConstant = 0.55;
+      analyser.fftSize = 16384;
+      analyser.smoothingTimeConstant = 0.35;
       source.connect(analyser);
 
       audioCtxRef.current = audioCtx;
@@ -344,6 +454,9 @@ export default function ChordDetectorPage() {
     analyserRef.current = null;
     streamRef.current = null;
     historyRef.current = [];
+    smoothedChromaRef.current.fill(0);
+    lastDetectionAtRef.current = 0;
+    lastConfidentAtRef.current = 0;
     setListening(false);
     setStatusText('Microphone idle');
     setChordName('—');
@@ -413,8 +526,8 @@ export default function ChordDetectorPage() {
     const ctx = new AudioContextCtor();
     const source = ctx.createMediaElementSource(el);
     const analyser = ctx.createAnalyser();
-    analyser.fftSize = 8192;
-    analyser.smoothingTimeConstant = 0.55;
+    analyser.fftSize = 16384;
+    analyser.smoothingTimeConstant = 0.35;
     source.connect(analyser);
     analyser.connect(ctx.destination); // keep the file audible during analysis
     fileCtxRef.current = ctx;
@@ -452,6 +565,9 @@ export default function ChordDetectorPage() {
       setChordName('—');
       setConfidence(0);
       historyRef.current = [];
+      smoothedChromaRef.current.fill(0);
+      lastDetectionAtRef.current = 0;
+      lastConfidentAtRef.current = 0;
       setFileUrl((prev) => {
         if (prev) URL.revokeObjectURL(prev);
         return URL.createObjectURL(file);
