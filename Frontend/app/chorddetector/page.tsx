@@ -73,15 +73,27 @@ function chromaFromFreqData(freqData: Float32Array, binHz: number): number[] {
   return chroma;
 }
 
-const MIN_FREQ = 55; // ~A1
-const MAX_FREQ = 1000;
+const MIN_FREQ = 55; // ~A1, chroma detection floor
+
+// Spectrum display range, aligned to octave boundaries (C2 .. C7) so the
+// log-frequency axis lands cleanly on note gridlines.
+const SPEC_MIN_FREQ = 65.41; // C2
+const SPEC_MAX_FREQ = 2093.0; // C7
+const SPEC_MIN_MIDI = 36; // C2
+const SPEC_MAX_MIDI = 96; // C7
 const HISTORY_LEN = 8;
 
+const AXIS_H = 20; // reserved height at bottom of spectrum for the note axis
+
 function freqToX(freq: number, w: number): number {
-  const logMin = Math.log2(MIN_FREQ);
-  const logMax = Math.log2(MAX_FREQ);
+  const logMin = Math.log2(SPEC_MIN_FREQ);
+  const logMax = Math.log2(SPEC_MAX_FREQ);
   const t = (Math.log2(freq) - logMin) / (logMax - logMin);
   return t * w;
+}
+
+function midiToFreq(m: number): number {
+  return 440 * Math.pow(2, (m - 69) / 12);
 }
 
 function formatTime(seconds: number): string {
@@ -226,16 +238,23 @@ export default function ChordDetectorPage() {
 
     const w = canvas.width;
     const h = canvas.height;
-    ctx.clearRect(0, 0, w, h);
 
-    ctx.strokeStyle = '#173028';
+    // white background
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, w, h);
+
+    // center reference line
+    ctx.strokeStyle = 'rgba(0,0,0,0.08)';
+    ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(0, h / 2);
     ctx.lineTo(w, h / 2);
     ctx.stroke();
 
-    ctx.strokeStyle = '#4ff2a3';
-    ctx.lineWidth = 1.5;
+    // blue waveform
+    ctx.strokeStyle = '#007aff';
+    ctx.lineWidth = 2;
+    ctx.lineJoin = 'round';
     ctx.beginPath();
     const slice = w / data.length;
     for (let i = 0; i < data.length; i++) {
@@ -284,66 +303,100 @@ export default function ChordDetectorPage() {
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
 
+      // Short-Time Fourier Transform snapshot: the analyser applies a windowed
+      // FFT to the most recent block of samples, so reading it every animation
+      // frame gives a spectrum that tracks the signal in real time.
       const freqData = new Float32Array(analyser.frequencyBinCount);
       analyser.getFloatFrequencyData(freqData);
 
       const w = canvas.width;
       const h = canvas.height;
-      ctx.clearRect(0, 0, w, h);
+      const plotH = h - AXIS_H; // magnitude plot area (axis sits below)
 
-      // pitch-class background shading + labels
-      for (let m = 24; m < 108; m++) {
-        const f0 = 440 * Math.pow(2, (m - 69) / 12);
-        const f1 = 440 * Math.pow(2, (m + 1 - 69) / 12);
-        if (f1 < MIN_FREQ || f0 > MAX_FREQ) continue;
-        const x0 = Math.max(0, freqToX(Math.max(f0, MIN_FREQ), w));
-        const x1 = Math.min(w, freqToX(Math.min(f1, MAX_FREQ), w));
-        const pc = ((m % 12) + 12) % 12;
-        ctx.fillStyle = pc === 0 ? 'rgba(79,242,163,0.10)' : 'rgba(79,242,163,0.03)';
-        ctx.fillRect(x0, 0, x1 - x0, h - 24);
-        if (x1 - x0 > 10) {
-          ctx.fillStyle = '#3a5b50';
-          ctx.font = '9px monospace';
-          ctx.fillText(NOTE_NAMES[pc], x0 + 2, h - 30);
-        }
-      }
+      // white background
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, w, h);
 
       const minDb = -100;
       const maxDb = -20;
+
+      // horizontal magnitude gridlines + dB scale labels (y-axis: magnitude)
+      ctx.textBaseline = 'middle';
+      ctx.font = '10px -apple-system, system-ui, sans-serif';
+      for (let db = maxDb; db >= minDb; db -= 20) {
+        const norm = (db - minDb) / (maxDb - minDb);
+        const y = plotH - norm * plotH;
+        ctx.strokeStyle = 'rgba(0,0,0,0.05)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(w, y);
+        ctx.stroke();
+        ctx.fillStyle = '#aeaeb2';
+        ctx.fillText(`${db}`, 3, y - 6);
+      }
+
+      // vertical note gridlines + note-name axis (x-axis: log-scaled frequency)
+      ctx.textBaseline = 'alphabetic';
+      for (let m = SPEC_MIN_MIDI; m <= SPEC_MAX_MIDI; m++) {
+        const freq = midiToFreq(m);
+        const x = freqToX(freq, w);
+        const pc = ((m % 12) + 12) % 12;
+        const isC = pc === 0;
+
+        ctx.strokeStyle = isC ? 'rgba(0,0,0,0.12)' : 'rgba(0,0,0,0.045)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, plotH);
+        ctx.stroke();
+
+        // label every natural note (sharps get a gridline only, to stay legible)
+        const isNatural = ![1, 3, 6, 8, 10].includes(pc);
+        if (isNatural) {
+          const octave = Math.floor(m / 12) - 1;
+          const label = isC ? `C${octave}` : NOTE_NAMES[pc];
+          ctx.fillStyle = isC ? '#1d1d1f' : '#8e8e93';
+          ctx.font = isC
+            ? '600 10px -apple-system, system-ui, sans-serif'
+            : '10px -apple-system, system-ui, sans-serif';
+          const tw = ctx.measureText(label).width;
+          ctx.fillText(label, x - tw / 2, h - 6);
+        }
+      }
+
       const sampleRate = audioCtx.sampleRate;
       const binHz = sampleRate / analyser.fftSize;
 
-      ctx.beginPath();
-      ctx.strokeStyle = '#4ff2a3';
-      ctx.lineWidth = 1.5;
-      let first = true;
-
+      // spectrum trace with a soft blue fill beneath it
+      const points: { x: number; y: number }[] = [];
       for (let i = 1; i < freqData.length; i++) {
         const freq = i * binHz;
-        if (freq < MIN_FREQ || freq > MAX_FREQ) continue;
-
+        if (freq < SPEC_MIN_FREQ || freq > SPEC_MAX_FREQ) continue;
         const db = freqData[i];
         const norm = Math.min(1, Math.max(0, (db - minDb) / (maxDb - minDb)));
-
-        const x = freqToX(freq, w);
-        const y = h - 24 - norm * (h - 24);
-        if (first) {
-          ctx.moveTo(x, y);
-          first = false;
-        } else {
-          ctx.lineTo(x, y);
-        }
+        points.push({ x: freqToX(freq, w), y: plotH - norm * plotH });
       }
-      ctx.stroke();
 
-      ctx.fillStyle = '#6e8d82';
-      ctx.font = '10px monospace';
-      [110, 220, 440, 880].forEach((f) => {
-        if (f >= MIN_FREQ && f <= MAX_FREQ) {
-          const x = freqToX(f, w);
-          ctx.fillText(`${f}Hz`, x - 14, h - 8);
-        }
-      });
+      if (points.length > 1) {
+        const grad = ctx.createLinearGradient(0, 0, 0, plotH);
+        grad.addColorStop(0, 'rgba(0,122,255,0.28)');
+        grad.addColorStop(1, 'rgba(0,122,255,0.02)');
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, plotH);
+        points.forEach((p) => ctx.lineTo(p.x, p.y));
+        ctx.lineTo(points[points.length - 1].x, plotH);
+        ctx.closePath();
+        ctx.fillStyle = grad;
+        ctx.fill();
+
+        ctx.beginPath();
+        points.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+        ctx.strokeStyle = '#007aff';
+        ctx.lineWidth = 1.75;
+        ctx.lineJoin = 'round';
+        ctx.stroke();
+      }
 
       const chroma = chromaFromFreqData(freqData, binHz);
       detectChord(chroma);
@@ -464,112 +517,115 @@ export default function ChordDetectorPage() {
   }, [selectedFile]);
 
   return (
-    <main className="min-h-screen bg-[#0b1210] text-[#d7e6df] font-mono flex flex-col items-center px-4 py-8">
-      <header className="w-full max-w-3xl mb-5 border-b border-[#1c2e29] pb-3">
-        <div className="text-[11px] tracking-[3px] uppercase text-[#4ff2a3]/80">
-          DSP / instrument
+    <main className="min-h-screen bg-[#f5f5f7] text-[#1d1d1f] flex flex-col items-center px-6 py-12">
+      <header className="w-full max-w-3xl mb-8 text-center">
+        <div className="text-[13px] font-medium tracking-wide uppercase text-[#0071e3]">
+          Chord Detector
         </div>
-        <h1 className="text-2xl font-bold mt-1">
-          Chord <span className="text-[#4ff2a3]">Scope</span>
+        <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight mt-2">
+          Chord Scope
         </h1>
-        <p className="text-[13px] text-[#6e8d82] mt-1.5">
-          Real-time waveform + FFT spectrum + chroma-based chord detection.
+        <p className="text-[16px] text-[#6e6e73] mt-3">
+          Real-time waveform, STFT spectrum, and chroma-based chord detection.
         </p>
       </header>
 
-      <div className="w-full max-w-3xl flex gap-2 mb-4">
-        <button
-          onClick={() => {
-            if (listening) stop();
-            setMode('file');
-          }}
-          className={`text-[12px] tracking-[2px] uppercase px-4 py-2 rounded border transition-colors ${
-            mode === 'file'
-              ? 'border-[#4ff2a3] text-[#4ff2a3] bg-[#4ff2a3]/10'
-              : 'border-[#1c2e29] text-[#6e8d82] hover:border-[#2c433c]'
-          }`}
-        >
-          Upload file
-        </button>
-        <button
-          onClick={() => setMode('mic')}
-          className={`text-[12px] tracking-[2px] uppercase px-4 py-2 rounded border transition-colors ${
-            mode === 'mic'
-              ? 'border-[#4ff2a3] text-[#4ff2a3] bg-[#4ff2a3]/10'
-              : 'border-[#1c2e29] text-[#6e8d82] hover:border-[#2c433c]'
-          }`}
-        >
-          Microphone
-        </button>
+      {/* segmented mode toggle */}
+      <div className="w-full max-w-3xl flex justify-center mb-8">
+        <div className="inline-flex gap-1 p-1 rounded-full bg-black/5">
+          <button
+            onClick={() => {
+              if (listening) stop();
+              setMode('file');
+            }}
+            className={`text-[14px] font-medium px-6 py-2 rounded-full transition-all ${
+              mode === 'file'
+                ? 'bg-white text-[#1d1d1f] shadow-[0_1px_4px_rgba(0,0,0,0.12)]'
+                : 'text-[#6e6e73] hover:text-[#1d1d1f]'
+            }`}
+          >
+            Upload file
+          </button>
+          <button
+            onClick={() => setMode('mic')}
+            className={`text-[14px] font-medium px-6 py-2 rounded-full transition-all ${
+              mode === 'mic'
+                ? 'bg-white text-[#1d1d1f] shadow-[0_1px_4px_rgba(0,0,0,0.12)]'
+                : 'text-[#6e6e73] hover:text-[#1d1d1f]'
+            }`}
+          >
+            Microphone
+          </button>
+        </div>
       </div>
 
       {mode === 'file' && (
-        <section className="w-full max-w-3xl bg-[#101c19] border border-[#1c2e29] rounded-md p-4">
-          <div className="text-[11px] tracking-[2px] uppercase text-[#6e8d82] mb-2">
+        <section className="w-full max-w-3xl bg-white rounded-3xl p-7 shadow-[0_2px_16px_rgba(0,0,0,0.06)] ring-1 ring-black/5">
+          <div className="text-[13px] font-semibold uppercase tracking-wide text-[#6e6e73] mb-4">
             Upload an audio recording
           </div>
 
-          <div className="flex items-center gap-3 flex-wrap">
+          <div className="flex items-center gap-4 flex-wrap">
             <input
               type="file"
               accept="audio/*"
               onChange={handleFileChange}
-              className="text-[13px] text-[#6e8d82] file:mr-3 file:border file:border-[#1c2e29] file:bg-[#0b1210] file:text-[#4ff2a3] file:rounded file:px-3 file:py-1.5 file:text-[12px] file:uppercase file:tracking-[1px] file:cursor-pointer"
+              className="text-[14px] text-[#6e6e73] file:mr-4 file:border-0 file:bg-black/5 file:text-[#1d1d1f] file:rounded-full file:px-5 file:py-2.5 file:text-[14px] file:font-medium file:cursor-pointer file:transition-colors hover:file:bg-black/10"
             />
             <button
               onClick={analyzeFile}
               disabled={!selectedFile || isAnalyzing}
-              className="border border-[#4ff2a3] text-[#4ff2a3] text-[13px] tracking-[2px] uppercase px-5 py-2.5 rounded hover:bg-[#4ff2a3] hover:text-[#08110e] transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-[#4ff2a3]"
+              className="bg-[#0071e3] text-white text-[15px] font-medium px-6 py-2.5 rounded-full shadow-[0_2px_8px_rgba(0,113,227,0.35)] transition-all hover:bg-[#0077ed] hover:shadow-[0_4px_14px_rgba(0,113,227,0.45)] active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none"
             >
               {isAnalyzing ? 'Analyzing…' : 'Detect chords'}
             </button>
           </div>
 
           {fileUrl && (
-            <audio controls src={fileUrl} className="w-full mt-4 h-10">
+            <audio controls src={fileUrl} className="w-full mt-6 h-10">
               Your browser does not support audio playback.
             </audio>
           )}
 
           {isAnalyzing && (
-            <div className="mt-4">
-              <div className="w-full h-1.5 bg-[#1c2e29] rounded-full overflow-hidden">
+            <div className="mt-5">
+              <div className="w-full h-1.5 bg-black/8 rounded-full overflow-hidden">
                 <div
-                  className="h-full bg-[#4ff2a3] transition-all duration-150"
+                  className="h-full bg-[#0071e3] transition-all duration-150"
                   style={{ width: `${Math.round(analyzeProgress * 100)}%` }}
                 />
               </div>
-              <div className="text-xs text-[#6e8d82] mt-1">
+              <div className="text-[13px] text-[#6e6e73] mt-2">
                 {Math.round(analyzeProgress * 100)}%
               </div>
             </div>
           )}
 
           {analyzeError && (
-            <div className="text-xs text-[#ff6b6b] mt-3">Error: {analyzeError}</div>
+            <div className="text-[13px] text-[#ff3b30] mt-4">Error: {analyzeError}</div>
           )}
 
           {!isAnalyzing && chordSequence.length > 0 && (
-            <div className="mt-5">
-              <div className="text-[11px] tracking-[2px] uppercase text-[#6e8d82] mb-2">
+            <div className="mt-7">
+              <div className="text-[13px] font-semibold uppercase tracking-wide text-[#6e6e73] mb-3">
                 Detected chord sequence
               </div>
-              <div className="max-h-96 overflow-y-auto rounded border border-[#1c2e29] divide-y divide-[#1c2e29]">
+              <div className="max-h-96 overflow-y-auto rounded-2xl bg-[#f5f5f7] divide-y divide-black/5">
                 {chordSequence.map((seg, i) => (
-                  <div key={i} className="flex items-center gap-4 px-3 py-2">
-                    <span className="text-xs text-[#6e8d82] w-24 shrink-0">
+                  <div key={i} className="flex items-center gap-4 px-4 py-3">
+                    <span className="text-[13px] text-[#6e6e73] w-24 shrink-0 tabular-nums">
                       {formatTime(seg.start)} – {formatTime(seg.end)}
                     </span>
-                    <span className="text-lg font-bold text-[#ffb454] w-14 shrink-0">
+                    <span className="text-xl font-semibold text-[#0071e3] w-14 shrink-0">
                       {seg.name}
                     </span>
-                    <div className="flex-1 h-1.5 bg-[#1c2e29] rounded-full overflow-hidden">
+                    <div className="flex-1 h-1.5 bg-black/8 rounded-full overflow-hidden">
                       <div
-                        className="h-full bg-[#4ff2a3]"
+                        className="h-full bg-[#0071e3]"
                         style={{ width: `${Math.round(seg.confidence * 100)}%` }}
                       />
                     </div>
-                    <span className="text-xs text-[#6e8d82] w-10 text-right shrink-0">
+                    <span className="text-[13px] text-[#6e6e73] w-10 text-right shrink-0 tabular-nums">
                       {Math.round(seg.confidence * 100)}%
                     </span>
                   </div>
@@ -581,55 +637,59 @@ export default function ChordDetectorPage() {
       )}
 
       {mode === 'mic' && (
-        <section className="w-full max-w-3xl bg-[#101c19] border border-[#1c2e29] rounded-md p-4">
-          <div className="flex items-center gap-3 mb-4 flex-wrap">
+        <section className="w-full max-w-3xl bg-white rounded-3xl p-7 shadow-[0_2px_16px_rgba(0,0,0,0.06)] ring-1 ring-black/5">
+          <div className="flex items-center gap-4 mb-6 flex-wrap">
             <button
               onClick={listening ? stop : start}
-              className="border border-[#4ff2a3] text-[#4ff2a3] text-[13px] tracking-[2px] uppercase px-5 py-2.5 rounded hover:bg-[#4ff2a3] hover:text-[#08110e] transition-colors"
+              className={`text-[15px] font-medium px-6 py-2.5 rounded-full shadow-[0_2px_8px_rgba(0,0,0,0.15)] transition-all active:scale-[0.98] ${
+                listening
+                  ? 'bg-[#ff3b30] text-white shadow-[0_2px_8px_rgba(255,59,48,0.35)] hover:bg-[#ff453a]'
+                  : 'bg-[#0071e3] text-white shadow-[0_2px_8px_rgba(0,113,227,0.35)] hover:bg-[#0077ed]'
+              }`}
             >
               {listening ? 'Stop' : 'Start listening'}
             </button>
             <span
-              className={`w-2 h-2 rounded-full ${
-                listening ? 'bg-[#4ff2a3] shadow-[0_0_8px_#4ff2a3]' : 'bg-[#6e8d82]'
+              className={`w-2.5 h-2.5 rounded-full ${
+                listening ? 'bg-[#34c759] shadow-[0_0_8px_#34c759]' : 'bg-[#c7c7cc]'
               }`}
             />
-            <span className="text-xs text-[#6e8d82]">{statusText}</span>
+            <span className="text-[14px] text-[#6e6e73]">{statusText}</span>
           </div>
 
-          <div className="text-[11px] tracking-[2px] uppercase text-[#6e8d82] mb-2">
+          <div className="text-[13px] font-semibold uppercase tracking-wide text-[#6e6e73] mb-2">
             Waveform — time domain
           </div>
           <canvas
             ref={waveCanvasRef}
             width={900}
             height={140}
-            className="w-full bg-[#08110e] rounded-sm"
+            className="w-full rounded-2xl ring-1 ring-black/5"
           />
 
-          <div className="text-[11px] tracking-[2px] uppercase text-[#6e8d82] mt-5 mb-2">
-            Spectrum — frequency domain, log scale
+          <div className="text-[13px] font-semibold uppercase tracking-wide text-[#6e6e73] mt-6 mb-2">
+            Spectrum — log frequency (note) &times; magnitude
           </div>
           <canvas
             ref={specCanvasRef}
             width={900}
-            height={260}
-            className="w-full bg-[#08110e] rounded-sm"
+            height={280}
+            className="w-full rounded-2xl ring-1 ring-black/5"
           />
 
-          <div className="flex items-baseline gap-6 mt-6 flex-wrap">
-            <div className="text-6xl font-bold text-[#ffb454] min-w-[160px] drop-shadow-[0_0_18px_rgba(255,180,84,0.35)]">
+          <div className="flex items-center gap-8 mt-8 flex-wrap">
+            <div className="text-7xl font-semibold text-[#0071e3] min-w-[160px] tracking-tight">
               {chordName}
             </div>
-            <div className="text-xs text-[#6e8d82] leading-relaxed">
-              confidence
-              <div className="w-40 h-1.5 bg-[#1c2e29] rounded-full overflow-hidden mt-1">
+            <div className="text-[13px] text-[#6e6e73]">
+              Confidence
+              <div className="w-44 h-1.5 bg-black/8 rounded-full overflow-hidden mt-1.5">
                 <div
-                  className="h-full bg-[#4ff2a3] transition-all duration-100"
+                  className="h-full bg-[#0071e3] transition-all duration-100"
                   style={{ width: `${confidence}%` }}
                 />
               </div>
-              <span>{confidence}%</span>
+              <span className="tabular-nums">{confidence}%</span>
             </div>
           </div>
         </section>
