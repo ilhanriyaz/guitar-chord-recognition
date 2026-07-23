@@ -26,18 +26,18 @@ USAGE:
   # Transcribe an audio file
   python whisper_demo.py --wav test_clip.wav --model small
 
-  # Record live from the microphone (5 seconds by default)
+  # Record live from the microphone -- press Enter to stop each recording,
+  # then 'q' + Enter to quit the session
   python whisper_demo.py --live --model small
-  python whisper_demo.py --live --duration 8
 
   (model options: tiny, base, small, medium, large-v3)
 """
 
 import argparse
+from functools import lru_cache
+
 import numpy as np
-import torch
-import matplotlib.pyplot as plt
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
+
 
 from librosa import load
 
@@ -50,29 +50,55 @@ def load_audio(wav_path: str):
     return y, sr
 
 
-def record_audio(duration: float = 5.0):
-    """Record `duration` seconds of mono audio from the default microphone."""
+def record_audio():
+    """Record mono audio from the default microphone until Enter is pressed."""
     import sounddevice as sd
 
-    print(f"\nRecording for {duration:.0f}s -- speak now...")
-    y = sd.rec(int(duration * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype="float32")
-    sd.wait()
+    frames = []
+
+    def callback(indata, frame_count, time_info, status):
+        frames.append(indata.copy())
+
+    print("\nRecording -- speak now, press Enter to stop...")
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=callback):
+        input()
     print("Recording finished.")
-    return y.flatten(), SAMPLE_RATE
+
+    y = np.concatenate(frames, axis=0).flatten() if frames else np.zeros(0, dtype="float32")
+    return y, SAMPLE_RATE
+
+
+@lru_cache(maxsize=None)
+def load_model(model_size: str = "small"):
+    """Load the Whisper processor/model once (cached) onto the GPU if available."""
+    import torch
+    from transformers import WhisperProcessor, WhisperForConditionalGeneration, logging
+    logging.set_verbosity_error()  # suppress warnings about missing tokenizer files
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    print(f"Loading whisper-{model_size} on {device} ({dtype})...")
+
+    model_name = f"openai/whisper-{model_size}"
+    processor = WhisperProcessor.from_pretrained(model_name)
+    model = WhisperForConditionalGeneration.from_pretrained(model_name, dtype=dtype)
+    model = model.to(device)
+    model.eval()
+
+    return processor, model, device, dtype
 
 
 def transcribe_with_attention(y: np.ndarray, sr: int = SAMPLE_RATE, model_size: str = "small"):
-    model_name = f"openai/whisper-{model_size}"
-    processor = WhisperProcessor.from_pretrained(model_name)
-    model = WhisperForConditionalGeneration.from_pretrained(model_name)
-    model = model.float()
-    model.eval()
+    import torch
+
+    processor, model, device, dtype = load_model(model_size)
 
     inputs = processor(y, sampling_rate=sr, return_tensors="pt")
+    input_features = inputs["input_features"].to(device=device, dtype=dtype)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         generated = model.generate(
-            inputs["input_features"],
+            input_features,
             output_attentions=True,
             return_dict_in_generate=True,
             max_new_tokens=128,
@@ -88,17 +114,20 @@ if __name__ == "__main__":
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--wav", help="Audio clip to transcribe")
     source.add_argument("--live", action="store_true", help="Record live from the microphone")
-    parser.add_argument("--duration", type=float, default=5.0,
-                        help="Recording length in seconds (used with --live)")
     parser.add_argument("--model", default="small",
                          choices=["tiny", "base", "small", "medium", "large-v3"])
     args = parser.parse_args()
 
     if args.live:
-        y, sr = record_audio(args.duration)
+        load_model(args.model)  # load once, before the loop
+        while True:
+            print("\nPress Enter to start recording (or 'q' + Enter to quit)...")
+            if input().strip().lower() == "q":
+                break
+            y, sr = record_audio()
+            transcription = transcribe_with_attention(y, sr, args.model)
+            print(f"\nTranscription: {transcription}")
     else:
         y, sr = load_audio(args.wav)
-
-    transcription = transcribe_with_attention(y, sr, args.model)
-
-    print(f"\nTranscription: {transcription}")
+        transcription = transcribe_with_attention(y, sr, args.model)
+        print(f"\nTranscription: {transcription}")

@@ -21,23 +21,21 @@ USAGE:
   # Transcribe an audio file
   python wav2vec_demo.py --wav test_clip.wav
 
-  # Record live from the microphone (5 seconds by default)
+  # Record live from the microphone -- press Enter to stop each recording,
+  # then 'q' + Enter to quit the session
   python wav2vec_demo.py --live
-  python wav2vec_demo.py --live --duration 8
 """
 
 import argparse
+from functools import lru_cache
+
 import numpy as np
-import torch
-import matplotlib.pyplot as plt
-from sklearn.decomposition import PCA
-from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
+
 
 from librosa import load
 
 MODEL_NAME = "facebook/wav2vec2-base-960h"  # swap for a larger checkpoint if you want stronger noise/accent robustness
 SAMPLE_RATE = 16000  # wav2vec2 expects 16kHz audio
-
 
 def load_audio(wav_path: str):
     """Load an audio file resampled to 16kHz mono."""
@@ -45,25 +43,58 @@ def load_audio(wav_path: str):
     return y, sr
 
 
-def record_audio(duration: float = 5.0):
-    """Record `duration` seconds of mono audio from the default microphone."""
+def record_audio():
+    """Record mono audio from the default microphone until Enter is pressed."""
     import sounddevice as sd
 
-    print(f"\nRecording for {duration:.0f}s -- speak now...")
-    y = sd.rec(int(duration * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype="float32")
-    sd.wait()
+    frames = []
+
+    def callback(indata, frame_count, time_info, status):
+        frames.append(indata.copy())
+
+    print("\nRecording -- speak now, press Enter to stop...")
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=callback):
+        input()
     print("Recording finished.")
-    return y.flatten(), SAMPLE_RATE
+
+    y = np.concatenate(frames, axis=0).flatten() if frames else np.zeros(0, dtype="float32")
+    return y, SAMPLE_RATE
+
+
+@lru_cache(maxsize=None)
+def load_model():
+    """Load the wav2vec2 processor/model once (cached) onto the GPU if available."""
+    import torch
+    from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor, logging
+    logging.set_verbosity_error()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    print(f"Loading {MODEL_NAME} on {device} ({dtype})...")
+
+    processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
+    model = Wav2Vec2ForCTC.from_pretrained(
+        MODEL_NAME,
+        output_hidden_states=True,
+        dtype=dtype,
+        attn_implementation="sdpa",
+    )
+    model = model.to(device)
+    model.eval()
+
+    return processor, model, device, dtype
 
 
 def transcribe(y: np.ndarray, sr: int = SAMPLE_RATE):
-    processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
-    model = Wav2Vec2ForCTC.from_pretrained(MODEL_NAME, output_hidden_states=True)
-    model.eval()
+    import torch
+
+    processor, model, device, dtype = load_model()
 
     inputs = processor(y, sampling_rate=sr, return_tensors="pt", padding=True)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    inputs["input_values"] = inputs["input_values"].to(dtype)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         outputs = model(**inputs)
 
     logits = outputs.logits  # (1, T, vocab_size)
@@ -78,15 +109,18 @@ if __name__ == "__main__":
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--wav", help="Audio clip to transcribe")
     source.add_argument("--live", action="store_true", help="Record live from the microphone")
-    parser.add_argument("--duration", type=float, default=5.0,
-                        help="Recording length in seconds (used with --live)")
     args = parser.parse_args()
 
     if args.live:
-        y, sr = record_audio(args.duration)
+        load_model()  # load once, before the loop
+        while True:
+            print("\nPress Enter to start recording (or 'q' + Enter to quit)...")
+            if input().strip().lower() == "q":
+                break
+            y, sr = record_audio()
+            transcription = transcribe(y, sr)
+            print(f"\nTranscription: {transcription}")
     else:
         y, sr = load_audio(args.wav)
-
-    transcription = transcribe(y, sr)
-
-    print(f"\nTranscription: {transcription}")
+        transcription = transcribe(y, sr)
+        print(f"\nTranscription: {transcription}")
