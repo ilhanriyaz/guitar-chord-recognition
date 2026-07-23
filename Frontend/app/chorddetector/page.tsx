@@ -96,117 +96,6 @@ function midiToFreq(m: number): number {
   return 440 * Math.pow(2, (m - 69) / 12);
 }
 
-function formatTime(seconds: number): string {
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return `${m}:${s.toString().padStart(2, '0')}`;
-}
-
-// ---------- file-based chord sequence detection ----------
-
-type ChordSegment = { start: number; end: number; name: string; confidence: number };
-
-const FILE_HOP = 0.25; // seconds between analysis windows
-
-// Smooth per-window raw detections with a majority-vote sliding window (matches the
-// live-mic smoothing), then collapse consecutive identical chords into segments.
-function smoothAndSegment(
-  raw: { time: number; name: string; score: number }[],
-  hop: number,
-): ChordSegment[] {
-  const smoothed = raw.map((_, i) => {
-    const windowSlice = raw.slice(Math.max(0, i - HISTORY_LEN + 1), i + 1);
-    const counts: Record<string, number> = {};
-    windowSlice.forEach((r) => (counts[r.name] = (counts[r.name] || 0) + 1));
-
-    let winner = windowSlice[windowSlice.length - 1].name;
-    let winnerCount = 0;
-    for (const name in counts) {
-      if (counts[name] > winnerCount) {
-        winnerCount = counts[name];
-        winner = name;
-      }
-    }
-    const avgScore =
-      windowSlice.filter((r) => r.name === winner).reduce((a, b) => a + b.score, 0) / winnerCount;
-
-    return { time: raw[i].time, name: winner, score: avgScore };
-  });
-
-  const segments: ChordSegment[] = [];
-  for (const point of smoothed) {
-    const last = segments[segments.length - 1];
-    if (last && last.name === point.name) {
-      last.end = point.time + hop;
-      last.confidence = (last.confidence + point.score) / 2;
-    } else {
-      segments.push({ start: point.time, end: point.time + hop, name: point.name, confidence: point.score });
-    }
-  }
-  return segments;
-}
-
-async function detectChordSequence(
-  file: File,
-  onProgress: (t: number) => void,
-): Promise<ChordSegment[]> {
-  const arrayBuffer = await file.arrayBuffer();
-  const AudioContextCtor = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-
-  const decodeCtx = new AudioContextCtor();
-  let audioBuffer: AudioBuffer;
-  try {
-    audioBuffer = await decodeCtx.decodeAudioData(arrayBuffer);
-  } finally {
-    await decodeCtx.close();
-  }
-
-  const offlineCtx = new OfflineAudioContext(
-    audioBuffer.numberOfChannels,
-    audioBuffer.length,
-    audioBuffer.sampleRate,
-  );
-  const source = offlineCtx.createBufferSource();
-  source.buffer = audioBuffer;
-  const analyser = offlineCtx.createAnalyser();
-  analyser.fftSize = 8192;
-  analyser.smoothingTimeConstant = 0.2;
-  source.connect(analyser);
-  analyser.connect(offlineCtx.destination);
-  source.start(0);
-
-  const duration = audioBuffer.duration;
-  const binHz = audioBuffer.sampleRate / analyser.fftSize;
-  const raw: { time: number; name: string; score: number }[] = [];
-
-  const suspendTimes: number[] = [];
-  for (let t = FILE_HOP; t < duration; t += FILE_HOP) suspendTimes.push(t);
-
-  const analyzeAt = (time: number) => {
-    const freqData = new Float32Array(analyser.frequencyBinCount);
-    analyser.getFloatFrequencyData(freqData);
-    const chroma = chromaFromFreqData(freqData, binHz);
-    const { name, score } = classifyChroma(chroma);
-    raw.push({ time, name, score });
-    onProgress(time / duration);
-  };
-
-  // Step the offline render forward one hop at a time, sampling the analyser at
-  // each stop. Chained so each suspend point is registered before rendering reaches it.
-  const stepping = suspendTimes.reduce(
-    (promise, t) => promise.then(() => offlineCtx.suspend(t)).then(() => {
-      analyzeAt(t);
-      return offlineCtx.resume();
-    }),
-    Promise.resolve(),
-  );
-
-  await Promise.all([stepping, offlineCtx.startRendering()]);
-
-  onProgress(1);
-  return smoothAndSegment(raw, FILE_HOP);
-}
-
 // ---------- component ----------
 
 export default function ChordDetectorPage() {
@@ -471,12 +360,80 @@ export default function ChordDetectorPage() {
   }, []);
 
   // --- uploaded-file state ---
+  // An uploaded audio/video file is played through the same AnalyserNode pipeline
+  // as the microphone, so its waveform, spectrum, and chord readout update live and
+  // stay in sync with playback (and with the video frame, for video files).
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileUrl, setFileUrl] = useState<string | null>(null);
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [analyzeProgress, setAnalyzeProgress] = useState(0);
-  const [analyzeError, setAnalyzeError] = useState<string | null>(null);
-  const [chordSequence, setChordSequence] = useState<ChordSegment[]>([]);
+  const [isVideo, setIsVideo] = useState(false);
+  const [filePlaying, setFilePlaying] = useState(false);
+
+  const mediaElRef = useRef<HTMLMediaElement | null>(null);
+  const fileCtxRef = useRef<AudioContext | null>(null);
+  const fileAnalyserRef = useRef<AnalyserNode | null>(null);
+  const fileSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const fileRafRef = useRef<number | null>(null);
+  const fileLoopRef = useRef<() => void>(() => {});
+
+  const stopFileLoop = useCallback(() => {
+    if (fileRafRef.current) cancelAnimationFrame(fileRafRef.current);
+    fileRafRef.current = null;
+  }, []);
+
+  const teardownFileGraph = useCallback(() => {
+    stopFileLoop();
+    fileCtxRef.current?.close();
+    fileCtxRef.current = null;
+    fileAnalyserRef.current = null;
+    fileSourceRef.current = null;
+  }, [stopFileLoop]);
+
+  const fileLoop = useCallback(() => {
+    const analyser = fileAnalyserRef.current;
+    const ctx = fileCtxRef.current;
+    if (!analyser || !ctx) return;
+    drawWaveform(analyser);
+    drawSpectrumAndDetect(analyser, ctx);
+    fileRafRef.current = requestAnimationFrame(() => fileLoopRef.current());
+  }, [drawWaveform, drawSpectrumAndDetect]);
+
+  useEffect(() => {
+    fileLoopRef.current = fileLoop;
+  }, [fileLoop]);
+
+  // Lazily wire the media element into a WebAudio graph. createMediaElementSource can
+  // only run once per element, so the element is remounted (keyed on fileUrl) whenever
+  // a new file is chosen and the previous graph is torn down first.
+  const ensureFileGraph = useCallback(() => {
+    const el = mediaElRef.current;
+    if (!el || fileCtxRef.current) return;
+    const AudioContextCtor =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const ctx = new AudioContextCtor();
+    const source = ctx.createMediaElementSource(el);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 8192;
+    analyser.smoothingTimeConstant = 0.55;
+    source.connect(analyser);
+    analyser.connect(ctx.destination); // keep the file audible during analysis
+    fileCtxRef.current = ctx;
+    fileSourceRef.current = source;
+    fileAnalyserRef.current = analyser;
+  }, []);
+
+  const handleMediaPlay = useCallback(() => {
+    ensureFileGraph();
+    fileCtxRef.current?.resume();
+    setFilePlaying(true);
+    stopFileLoop();
+    fileRafRef.current = requestAnimationFrame(() => fileLoopRef.current());
+  }, [ensureFileGraph, stopFileLoop]);
+
+  const handleMediaPause = useCallback(() => {
+    stopFileLoop();
+    setFilePlaying(false);
+  }, [stopFileLoop]);
 
   useEffect(() => {
     return () => {
@@ -488,33 +445,33 @@ export default function ChordDetectorPage() {
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
       if (!file) return;
+      teardownFileGraph();
       setSelectedFile(file);
-      setChordSequence([]);
-      setAnalyzeError(null);
-      setAnalyzeProgress(0);
+      setIsVideo(file.type.startsWith('video'));
+      setFilePlaying(false);
+      setChordName('—');
+      setConfidence(0);
+      historyRef.current = [];
       setFileUrl((prev) => {
         if (prev) URL.revokeObjectURL(prev);
         return URL.createObjectURL(file);
       });
     },
-    [],
+    [teardownFileGraph],
   );
 
-  const analyzeFile = useCallback(async () => {
-    if (!selectedFile) return;
-    setIsAnalyzing(true);
-    setAnalyzeError(null);
-    setAnalyzeProgress(0);
-    setChordSequence([]);
-    try {
-      const segments = await detectChordSequence(selectedFile, setAnalyzeProgress);
-      setChordSequence(segments);
-    } catch (err) {
-      setAnalyzeError((err as Error).message);
-    } finally {
-      setIsAnalyzing(false);
+  // Stop live file analysis when leaving file mode, and clean it up on unmount.
+  useEffect(() => {
+    if (mode !== 'file') {
+      // pause() fires the media element's 'pause' event, which clears filePlaying.
+      mediaElRef.current?.pause();
+      stopFileLoop();
     }
-  }, [selectedFile]);
+  }, [mode, stopFileLoop]);
+
+  useEffect(() => {
+    return () => teardownFileGraph();
+  }, [teardownFileGraph]);
 
   return (
     <main className="min-h-screen bg-[#f5f5f7] text-[#1d1d1f] flex flex-col items-center px-6 py-12">
@@ -562,76 +519,89 @@ export default function ChordDetectorPage() {
       {mode === 'file' && (
         <section className="w-full max-w-3xl bg-white rounded-3xl p-7 shadow-[0_2px_16px_rgba(0,0,0,0.06)] ring-1 ring-black/5">
           <div className="text-[13px] font-semibold uppercase tracking-wide text-[#6e6e73] mb-4">
-            Upload an audio recording
+            Upload an audio or video recording
           </div>
 
           <div className="flex items-center gap-4 flex-wrap">
             <input
               type="file"
-              accept="audio/*"
+              accept="audio/*,video/*"
               onChange={handleFileChange}
               className="text-[14px] text-[#6e6e73] file:mr-4 file:border-0 file:bg-black/5 file:text-[#1d1d1f] file:rounded-full file:px-5 file:py-2.5 file:text-[14px] file:font-medium file:cursor-pointer file:transition-colors hover:file:bg-black/10"
             />
-            <button
-              onClick={analyzeFile}
-              disabled={!selectedFile || isAnalyzing}
-              className="bg-[#0071e3] text-white text-[15px] font-medium px-6 py-2.5 rounded-full shadow-[0_2px_8px_rgba(0,113,227,0.35)] transition-all hover:bg-[#0077ed] hover:shadow-[0_4px_14px_rgba(0,113,227,0.45)] active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none"
-            >
-              {isAnalyzing ? 'Analyzing…' : 'Detect chords'}
-            </button>
+            <span className="text-[14px] text-[#6e6e73]">
+              {selectedFile ? (filePlaying ? 'Analyzing playback…' : 'Press play to analyze') : 'No file selected'}
+            </span>
           </div>
 
-          {fileUrl && (
-            <audio controls src={fileUrl} className="w-full mt-6 h-10">
+          {fileUrl && isVideo && (
+            <video
+              key={fileUrl}
+              ref={mediaElRef as React.RefObject<HTMLVideoElement>}
+              controls
+              src={fileUrl}
+              onPlay={handleMediaPlay}
+              onPause={handleMediaPause}
+              onEnded={handleMediaPause}
+              className="w-full mt-6 rounded-2xl bg-black ring-1 ring-black/5 max-h-[420px]"
+            >
+              Your browser does not support video playback.
+            </video>
+          )}
+
+          {fileUrl && !isVideo && (
+            <audio
+              key={fileUrl}
+              ref={mediaElRef as React.RefObject<HTMLAudioElement>}
+              controls
+              src={fileUrl}
+              onPlay={handleMediaPlay}
+              onPause={handleMediaPause}
+              onEnded={handleMediaPause}
+              className="w-full mt-6 h-10"
+            >
               Your browser does not support audio playback.
             </audio>
           )}
 
-          {isAnalyzing && (
-            <div className="mt-5">
-              <div className="w-full h-1.5 bg-black/8 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-[#0071e3] transition-all duration-150"
-                  style={{ width: `${Math.round(analyzeProgress * 100)}%` }}
-                />
+          {fileUrl && (
+            <>
+              <div className="text-[13px] font-semibold uppercase tracking-wide text-[#6e6e73] mt-6 mb-2">
+                Waveform — time domain
               </div>
-              <div className="text-[13px] text-[#6e6e73] mt-2">
-                {Math.round(analyzeProgress * 100)}%
-              </div>
-            </div>
-          )}
+              <canvas
+                ref={waveCanvasRef}
+                width={900}
+                height={140}
+                className="w-full rounded-2xl ring-1 ring-black/5"
+              />
 
-          {analyzeError && (
-            <div className="text-[13px] text-[#ff3b30] mt-4">Error: {analyzeError}</div>
-          )}
-
-          {!isAnalyzing && chordSequence.length > 0 && (
-            <div className="mt-7">
-              <div className="text-[13px] font-semibold uppercase tracking-wide text-[#6e6e73] mb-3">
-                Detected chord sequence
+              <div className="text-[13px] font-semibold uppercase tracking-wide text-[#6e6e73] mt-6 mb-2">
+                Spectrum — log frequency (note) &times; magnitude
               </div>
-              <div className="max-h-96 overflow-y-auto rounded-2xl bg-[#f5f5f7] divide-y divide-black/5">
-                {chordSequence.map((seg, i) => (
-                  <div key={i} className="flex items-center gap-4 px-4 py-3">
-                    <span className="text-[13px] text-[#6e6e73] w-24 shrink-0 tabular-nums">
-                      {formatTime(seg.start)} – {formatTime(seg.end)}
-                    </span>
-                    <span className="text-xl font-semibold text-[#0071e3] w-14 shrink-0">
-                      {seg.name}
-                    </span>
-                    <div className="flex-1 h-1.5 bg-black/8 rounded-full overflow-hidden">
-                      <div
-                        className="h-full bg-[#0071e3]"
-                        style={{ width: `${Math.round(seg.confidence * 100)}%` }}
-                      />
-                    </div>
-                    <span className="text-[13px] text-[#6e6e73] w-10 text-right shrink-0 tabular-nums">
-                      {Math.round(seg.confidence * 100)}%
-                    </span>
+              <canvas
+                ref={specCanvasRef}
+                width={900}
+                height={280}
+                className="w-full rounded-2xl ring-1 ring-black/5"
+              />
+
+              <div className="flex items-center gap-8 mt-8 flex-wrap">
+                <div className="text-7xl font-semibold text-[#0071e3] min-w-[160px] tracking-tight">
+                  {chordName}
+                </div>
+                <div className="text-[13px] text-[#6e6e73]">
+                  Confidence
+                  <div className="w-44 h-1.5 bg-black/8 rounded-full overflow-hidden mt-1.5">
+                    <div
+                      className="h-full bg-[#0071e3] transition-all duration-100"
+                      style={{ width: `${confidence}%` }}
+                    />
                   </div>
-                ))}
+                  <span className="tabular-nums">{confidence}%</span>
+                </div>
               </div>
-            </div>
+            </>
           )}
         </section>
       )}
