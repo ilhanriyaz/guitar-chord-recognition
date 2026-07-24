@@ -1,38 +1,3 @@
-"""
-demo_whisper.py
-
-Whisper demo: encoder-decoder + cross-attention, trained multitask on
-680k hours of weakly-labeled, noisy, multilingual web audio.
-
-WHAT TO SHOW AND WHY:
-The contrast with wav2vec2 isn't "better feature learning" -- it's
-architecture and training philosophy:
-  - wav2vec2: encoder only, self-supervised pretraining, needs a CTC/LM
-    head fine-tuned per task.
-  - Whisper: full encoder-DECODER, trained end-to-end and supervised
-    (albeit weakly) directly on (audio, text) pairs at massive scale, so
-    it can transcribe, translate, or detect language with ONE model and
-    no fine-tuning.
-
-The visual payoff here is the cross-attention map: for each output token
-the decoder generates, which encoder audio frames did it attend to? Unlike
-the GMM-HMM's rigid left-to-right state machine, Whisper's decoder is free
-to attend anywhere in the audio -- and in practice you'll usually still see
-a roughly monotonic diagonal, which is itself a great talking point: "it
-wasn't told to go in order, it learned that speech and text are usually
-monotonically aligned."
-
-USAGE:
-  # Transcribe an audio file
-  python whisper_demo.py --wav test_clip.wav --model small
-
-  # Record live from the microphone -- press Enter to stop each recording,
-  # then 'q' + Enter to quit the session
-  python whisper_demo.py --live --model small
-
-  (model options: tiny, base, small, medium, large-v3)
-"""
-
 import argparse
 from functools import lru_cache
 

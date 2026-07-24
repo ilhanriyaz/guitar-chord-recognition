@@ -1,31 +1,3 @@
-"""
-demo_wav2vec2.py
-
-wav2vec2 demo: self-supervised pretraining + CTC fine-tuning.
-
-WHAT TO SHOW AND WHY:
-The core contrast with GMM-HMM is that wav2vec2 never sees a hand-designed
-feature like an MFCC -- it learns its own representation directly from raw
-waveform samples via contrastive self-supervised pretraining, then a thin
-CTC head maps those learned representations to characters/subwords.
-
-Two things worth putting on screen:
-  1. The transcript itself (works on out-of-vocabulary words / made-up words
-     far better than the GMM-HMM, because there's no fixed lexicon).
-  2. A 2D projection (PCA) of the model's internal hidden-state embeddings,
-     colored by the character each frame decodes to. This is the visual
-     payoff: you can literally see the model has organized similar sounds
-     into clusters *without anyone telling it what a phoneme is*.
-
-USAGE:
-  # Transcribe an audio file
-  python wav2vec_demo.py --wav test_clip.wav
-
-  # Record live from the microphone -- press Enter to stop each recording,
-  # then 'q' + Enter to quit the session
-  python wav2vec_demo.py --live
-"""
-
 import argparse
 from functools import lru_cache
 
